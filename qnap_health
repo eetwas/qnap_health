@@ -34,6 +34,8 @@ usage() {
   echo "       -h                    - no human-readable output; do not use unit suffixes"
   echo "       -w|--warning          - warning"
   echo "       -c|--critical         - critical"
+  echo "       -tw|--tempwarning     - diskstatus temperature warning"
+  echo "       -tc|--tempcritical    - diskstatus temperature critical"
   echo "       -t|--timeout          - timeout for snmp connect, default: 5s"
   echo "       --help                - show this help"
   echo
@@ -53,7 +55,7 @@ usage() {
   echo "       -x|--privprotocol     - privacy protocol (DES|AES)"
   echo "       -X|--privpassphrase   - privacy protocol pass phrase"
   echo
-  echo "Parts are: status, sysinfo, systemuptime, temp, cpu, cputemp, usedram, iops, latency, powerstatus, fans, diskused, hdstatus, hdtemp, lunstatus (for iSCSI luns), volstatus (Raid Volume Status)"
+  echo "Parts are: status, sysinfo, systemuptime, temp, cpu, cputemp, usedram, iops, latency, powerstatus, fans, diskstatus, diskused, hdstatus, hdtemp, lunstatus (for iSCSI luns), volstatus (Raid Volume Status)"
   echo
   echo "volstatus & lunstatus checks all vols/luns and vols/lun space; powerstatus checks power supply"
   echo "<#> is 1-8 for hd, 1-5 for vol"
@@ -174,6 +176,15 @@ while true; do
       strCritical="$2"
       shift 2
       ;;
+    -tw|--tempwarning)
+      strTempWarning="$2"
+      shift 2
+      ;;
+    -tc|--tempcritical)
+      strTempCritical="$2"
+      shift 2
+      ;;
+
     -t|--timeout)
       timeout="$2"
       shift 2
@@ -251,7 +262,7 @@ while true; do
   esac
 done
 
-if ([ "$strPart" != "sysinfo" -a "$strPart" != "hdstatus" -a "$strPart" != "powerstatus" ]) && ( [ -z "$strWarning" -o -z "$strCritical" ]);then
+if ([ "$strPart" != "sysinfo" -a "$strPart" != "diskstatus" -a "$strPart" != "hdstatus" -a "$strPart" != "powerstatus" ]) && ( [ -z "$strWarning" -o -z "$strCritical" ]);then
   echo "UKNOWN: $strPart check needs warning and critical threshold set."
   exit 3
 fi
@@ -316,6 +327,165 @@ fi
 # STATUS ---------------------------------------------------------------------------------------------------------------------------------------
 if [ "$strPart" == "status" ]; then
   echo "$TEST";
+
+# DISKSTATUS ---------------------------------------------------------------------------------------------------------------------------------------
+elif [ "$strPart" == "diskstatus" ]; then
+  ALLOUTPUT=""
+  PERFOUTPUT=""
+  DISK=1; DISKIDX=1
+
+  WARNING=0
+  CRITICAL=0
+  DISK_OK=0
+  DISK_WARNING=0
+  DISK_CRITICAL=0
+  SMART_GOOD=0
+  SMART_WARNING=0
+  SMART_ERROR=0
+  SMART_ABNORMAL=0
+
+  DISKCOUNT="$(_snmpgetval .1.3.6.1.4.1.24681.1.4.1.1.1.1.5.1.0)"
+  MSATACOUNT="$(_snmpgetval .1.3.6.1.4.1.24681.1.4.1.1.1.1.6.1.0)"
+
+  ALLDISKCOUNT="`expr $DISKCOUNT + $MSATACOUNT`"
+
+  if [[ "$strWarning" && "$ALLDISKCOUNT" -le "$strWarning" ]]; then
+    ALLOUTPUT="WARNING: Disk count is lower than $strWarning\n"
+    WARNING=1
+  fi
+
+  if [[ "$strCritical" && "$ALLDISKCOUNT" -le "$strCritical" ]]; then
+    ALLOUTPUT="CRITICAL: Disk count is lower than $strCritical\n"
+    WARNING=0
+    CRITICAL=1
+  fi
+
+  while [ "$DISKIDX" -le "$ALLDISKCOUNT" ]; do
+    if [ "$DISKIDX" -le "$DISKCOUNT" ]; then
+      table_snmp=".1.3.6.1.4.1.24681.1.4.1.1.1.1.5.2.1"
+      disktype=""
+      DISK="$DISKIDX"
+    else
+      table_snmp=".1.3.6.1.4.1.24681.1.4.1.1.1.1.6.2.1"
+      disktype="mSATA"
+      DISK="`expr $DISKIDX - $DISKCOUNT`"
+    fi
+    
+    Disk_Status="$(_snmpgetval "$table_snmp.4.$DISK" | sed 's/^"\(.*\).$/\1/')"
+
+   if [ "$Disk_Status" != "No Such Instance currently exists at this OID" ]; then
+      if [ "$Disk_Status" == "Good" ]; then
+        DISKSTAT="Status: $Disk_Status"
+        DISK_OK="`expr $DISK_OK + 1`"
+      elif [ "$Disk_Status" == "Warning" ]; then
+        DISKSTAT="Status: $Disk_Status"
+        WARNING=1
+        DISK_WARNING="`expr $DISK_WARNING + 1`"
+      else
+        DISKSTAT="Status: $Disk_Status"
+        WARNING=0
+        CRITICAL=1
+        DISK_CRITICAL="`expr $DISK_CRITICAL + 1`"
+      fi
+
+      diskSmartInfo="$(_snmpgetval "$table_snmp.5.$DISK" | sed 's/^"\(.*\).$/\1/')"
+
+      if [ "$diskSmartInfo" -eq "0" ]; then
+        DISKSTAT="${DISKSTAT}, SMART: Good"
+        SMART_GOOD="`expr $SMART_GOOD + 1`"
+      elif [ "$diskSmartInfo" -eq "-1" ]; then
+        DISKSTAT="${DISKSTAT}, SMART: Error"
+        WARNING=0
+        CRITICAL=1
+        SMART_ERROR="`expr $SMART_ERROR + 1`"
+      elif [ "$diskSmartInfo" -eq "1" ]; then
+        DISKSTAT="${DISKSTAT}, SMART: Warning"
+        WARNING=1
+        SMART_WARNING="`expr $SMART_WARNING + 1`"
+      elif [ "$diskSmartInfo" -eq "2" ]; then
+        DISKSTAT="${DISKSTAT}, SMART: Abnormal"
+        WARNING=0
+        CRITICAL=1
+        SMART_ABNORMAL="`expr $SMART_ABNORMAL + 1`"
+      fi
+
+
+      diskCpctStr="$(_snmpgetval "$table_snmp.9.$DISK")"
+      fdiskCpctStr=""
+
+      # Assume all disks have sizes in the GB to TB range & format accordingly
+      if [ "$(echo "scale=0; 2^40" | bc -l)" -lt "$diskCpctStr" ]; then
+        fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^40)" | bc -l)TB"
+      elif [ "$(echo "scale=0; 2^30" | bc -l)" -lt "$diskCpctStr" ]; then
+        fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^30)" | bc -l)GB"
+      fi
+
+      diskTemperature="$(_snmpgetval "$table_snmp.6.$DISK")"
+      
+      if [[ "$strTempWarning" && "$diskTemperature" -ge "$strTempWarning" ]]; then
+        WARNING=1
+      elif [[ "$strTempCritical" && "$diskTemperature" -ge "$strTempCritical" ]]; then
+        CRITICAL=1
+      fi
+
+      diskGlobalSpare="$(_snmpgetval "$table_snmp.7.$DISK")"
+      diskGlobalSpareStr=""
+
+      if [ "$diskGlobalSpare" -eq "1" ]; then
+        diskGlobalSpareStr=" Global Spare,"
+      fi
+
+      diskId="$(_snmpgetval "$table_snmp.2.$DISK")"
+      diskModel="$(_snmpgetval "$table_snmp.8.$DISK")"
+
+      if [ $DISK_CRITICAL -eq 1 ]; then
+        ALLOUTPUT="${ALLOUTPUT}CRITICAL: "
+      elif [ $DISK_WARNING -eq 1 ]; then
+        ALLOUTPUT="${ALLOUTPUT}WARNING: "
+      fi
+
+      ALLOUTPUT="${ALLOUTPUT} $disktype Disk $DISK (ID $diskId) $DISKSTAT,$diskGlobalSpareStr Capacity: $fdiskCpctStr, Temperature: ${diskTemperature}°C, Model: $diskModel"
+
+      if [ "$DISK" -lt "$DISKCOUNT" ]; then
+        ALLOUTPUT="${ALLOUTPUT}\n"
+      fi
+
+      #Performance Data
+      if [ $DISK -gt 1 ]; then
+        PERFDATA="$PERFDATA "
+      fi
+      PERFDATA="${PERFDATA}Capacity_${disktype}Disk_$diskId=$fdiskCpctStr;;;; Temperature_${disktype}Disk_$diskId=$diskTemperature;$strTempWarning;$strTempCritical;;"
+    fi
+    DISKIDX="`expr $DISKIDX + 1`"
+  done
+
+  if [ "$strWarning" != "" ]; then
+    outStrWarning="$strWarning:"
+  fi
+
+  if [ "$strCritical" != "" ]; then
+    outStrCritical="$strCritical:"
+  fi
+
+  if [ $DISK_CRITICAL -ge 1 ]; then
+    ALLOUTPUT="CRITICAL: One or more Disks in critical condition.\n${ALLOUTPUT}"
+  elif [ $DISK_WARNING -ge 1 ]; then
+    ALLOUTPUT="WARNING: One or more Disks in warning condition.\n${ALLOUTPUT}"
+  fi
+
+  PERFDATA="DiskCount=$ALLDISKCOUNT;$outStrWarning;$outStrCritical;; DiskOK=$DISK_OK;;;; DiskWarning=$DISK_WARNING;;;; DiskCritical=$DISK_CRITICAL;;;; SmartGood=$SMART_GOOD;;;; SmartWarning=$SMART_WARNING;;;; SmartError=$SMART_ERROR;;;; SmartAbnormal=$SMART_ABNORMAL;;;; ${PERFDATA}"
+
+  printf "${ALLOUTPUT}|${PERFDATA}";
+
+  if [ $CRITICAL -eq 1 ]; then
+    exit $EXIT_CRITICAL
+  elif [ $WARNING -eq 1 ]; then
+    exit $EXIT_WARNING
+  else
+    exit $EXIT_OK
+  fi
+
+
 
 # DISKUSED ---------------------------------------------------------------------------------------------------------------------------------------
 elif [ "$strPart" == "diskused" ]; then
@@ -663,6 +833,7 @@ elif [ "$strPart" == "lunstatus" ]; then
   else
     exit $EXIT_OK
   fi
+
 # Volume Status----------------------------------------------------------------------------------------------------------------------------------------
 elif [ "$strPart" == "volstatus" ]; then
   ALLOUTPUT=""
