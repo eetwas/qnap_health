@@ -680,12 +680,12 @@ elif [ "$strPart" == "volstatus" ]; then
     Vol_Status="$(_snmpgetval ".1.3.6.1.4.1.24681.1.2.17.1.6.$VOL" | sed 's/^"\(.*\).$/\1/')"
    if [ "$Vol_Status" != "No Such Instance currently exists at this OID" ]; then
       if [ "$Vol_Status" == "Ready" ]; then
-        VOLSTAT="OK: $Vol_Status"
+        VOLSTAT="OK: Volume Status is \"$Vol_Status\""
       elif [ "$Vol_Status" == "Rebuilding..." ]; then
-        VOLSTAT="WARNING: $Vol_Status"
+        VOLSTAT="WARNING: Volume Status is \"$Vol_Status\""
         WARNING=1
       else
-        VOLSTAT="CRITICAL: $Vol_Status"
+        VOLSTAT="CRITICAL: Volume Status is \"$Vol_Status\""
         CRITICAL=1
       fi
 
