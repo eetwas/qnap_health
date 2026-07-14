@@ -330,6 +330,8 @@ if [ "$strPart" == "status" ]; then
 
 # DISKSTATUS ---------------------------------------------------------------------------------------------------------------------------------------
 elif [ "$strPart" == "diskstatus" ]; then
+  EX_HDD=false
+
   ALLOUTPUT=""
   PERFOUTPUT=""
   DISK=1; DISKIDX=1
@@ -347,6 +349,12 @@ elif [ "$strPart" == "diskstatus" ]; then
   DISKCOUNT="$(_snmpgetval .1.3.6.1.4.1.24681.1.4.1.1.1.1.5.1.0)"
   MSATACOUNT="$(_snmpgetval .1.3.6.1.4.1.24681.1.4.1.1.1.1.6.1.0)"
 
+  if [[ "No Such Object available on this agent at this OID" == "$DISKCOUNT" ]]; then
+    EX_HDD=true
+    DISKCOUNT="$(_snmpgetval .1.3.6.1.4.1.24681.1.3.10.0)"
+    MSATACOUNT=0
+  fi
+
   ALLDISKCOUNT="`expr $DISKCOUNT + $MSATACOUNT`"
 
   if [[ "$strWarning" && "$ALLDISKCOUNT" -le "$strWarning" ]]; then
@@ -363,6 +371,11 @@ elif [ "$strPart" == "diskstatus" ]; then
   while [ "$DISKIDX" -le "$ALLDISKCOUNT" ]; do
     if [ "$DISKIDX" -le "$DISKCOUNT" ]; then
       table_snmp=".1.3.6.1.4.1.24681.1.4.1.1.1.1.5.2.1"
+
+      if [[ "$EX_HDD" = true ]]; then
+        table_snmp=".1.3.6.1.4.1.24681.1.3.11.1"
+      fi
+
       disktype=""
       DISK="$DISKIDX"
     else
@@ -371,92 +384,173 @@ elif [ "$strPart" == "diskstatus" ]; then
       DISK="`expr $DISKIDX - $DISKCOUNT`"
     fi
     
-    Disk_Status="$(_snmpgetval "$table_snmp.4.$DISK" | sed 's/^"\(.*\).$/\1/')"
+    if [[ "$EX_HDD" = false ]]; then
+      Disk_Status="$(_snmpgetval "$table_snmp.4.$DISK" | sed 's/^"\(.*\).$/\1/')"
 
-   if [ "$Disk_Status" != "No Such Instance currently exists at this OID" ]; then
-      if [ "$Disk_Status" == "Good" ]; then
-        DISKSTAT="Status: $Disk_Status"
-        DISK_OK="`expr $DISK_OK + 1`"
-      elif [ "$Disk_Status" == "Warning" ]; then
-        DISKSTAT="Status: $Disk_Status"
-        WARNING=1
-        DISK_WARNING="`expr $DISK_WARNING + 1`"
-      else
-        DISKSTAT="Status: $Disk_Status"
-        WARNING=0
-        CRITICAL=1
-        DISK_CRITICAL="`expr $DISK_CRITICAL + 1`"
+      if [ "$Disk_Status" != "No Such Instance currently exists at this OID" ]; then
+        if [ "$Disk_Status" == "Good" ]; then
+          DISKSTAT="Status: $Disk_Status"
+          DISK_OK="`expr $DISK_OK + 1`"
+        elif [ "$Disk_Status" == "Warning" ]; then
+          DISKSTAT="Status: $Disk_Status"
+          WARNING=1
+          DISK_WARNING="`expr $DISK_WARNING + 1`"
+        else
+          DISKSTAT="Status: $Disk_Status"
+          WARNING=0
+          CRITICAL=1
+          DISK_CRITICAL="`expr $DISK_CRITICAL + 1`"
+        fi
+
+        diskSmartInfo="$(_snmpgetval "$table_snmp.5.$DISK" | sed 's/^"\(.*\).$/\1/')"
+
+        if [ "$diskSmartInfo" -eq "0" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Good"
+          SMART_GOOD="`expr $SMART_GOOD + 1`"
+        elif [ "$diskSmartInfo" -eq "-1" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Error"
+          WARNING=0
+          CRITICAL=1
+          SMART_ERROR="`expr $SMART_ERROR + 1`"
+        elif [ "$diskSmartInfo" -eq "1" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Warning"
+          WARNING=1
+          SMART_WARNING="`expr $SMART_WARNING + 1`"
+        elif [ "$diskSmartInfo" -eq "2" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Abnormal"
+          WARNING=0
+          CRITICAL=1
+          SMART_ABNORMAL="`expr $SMART_ABNORMAL + 1`"
+        fi
+
+
+        diskCpctStr="$(_snmpgetval "$table_snmp.9.$DISK")"
+        fdiskCpctStr=""
+
+        # Assume all disks have sizes in the GB to TB range & format accordingly
+        if [ "$(echo "scale=0; 2^40" | bc -l)" -lt "$diskCpctStr" ]; then
+          fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^40)" | bc -l)TB"
+        elif [ "$(echo "scale=0; 2^30" | bc -l)" -lt "$diskCpctStr" ]; then
+          fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^30)" | bc -l)GB"
+        fi
+
+        diskTemperature="$(_snmpgetval "$table_snmp.6.$DISK")"
+        
+        if [[ "$strTempWarning" && "$diskTemperature" -ge "$strTempWarning" ]]; then
+          WARNING=1
+        elif [[ "$strTempCritical" && "$diskTemperature" -ge "$strTempCritical" ]]; then
+          CRITICAL=1
+        fi
+
+        diskGlobalSpare="$(_snmpgetval "$table_snmp.7.$DISK")"
+        diskGlobalSpareStr=""
+
+        if [ "$diskGlobalSpare" -eq "1" ]; then
+          diskGlobalSpareStr=" Global Spare,"
+        fi
+
+        diskId="$(_snmpgetval "$table_snmp.2.$DISK")"
+        diskModel="$(_snmpgetval "$table_snmp.8.$DISK")"
+
+        if [ $DISK_CRITICAL -eq 1 ]; then
+          ALLOUTPUT="${ALLOUTPUT}CRITICAL: "
+        elif [ $DISK_WARNING -eq 1 ]; then
+          ALLOUTPUT="${ALLOUTPUT}WARNING: "
+        fi
+
+        ALLOUTPUT="${ALLOUTPUT} $disktype Disk $DISK (ID $diskId) $DISKSTAT,$diskGlobalSpareStr Capacity: $fdiskCpctStr, Temperature: ${diskTemperature}°C, Model: $diskModel"
+
+        if [ "$DISK" -lt "$DISKCOUNT" ]; then
+          ALLOUTPUT="${ALLOUTPUT}\n"
+        fi
+
+        #Performance Data
+        if [ $DISK -gt 1 ]; then
+          PERFDATA="$PERFDATA "
+        fi
+        PERFDATA="${PERFDATA}Capacity_${disktype}Disk_$diskId=$fdiskCpctStr;;;; Temperature_${disktype}Disk_$diskId=$diskTemperature;$strTempWarning;$strTempCritical;;"
       fi
+      DISKIDX="`expr $DISKIDX + 1`"
+    else
+      Disk_Status="$(_snmpgetval "$table_snmp.4.$DISK" | sed 's/^"\(.*\).$/\1/')"
 
-      diskSmartInfo="$(_snmpgetval "$table_snmp.5.$DISK" | sed 's/^"\(.*\).$/\1/')"
+      if [ "$Disk_Status" != "No Such Instance currently exists at this OID" ]; then
+        diskModel="$(_snmpgetval "$table_snmp.5.$DISK" | tr -d '"' | xargs)"
 
-      if [ "$diskSmartInfo" -eq "0" ]; then
-        DISKSTAT="${DISKSTAT}, SMART: Good"
-        SMART_GOOD="`expr $SMART_GOOD + 1`"
-      elif [ "$diskSmartInfo" -eq "-1" ]; then
-        DISKSTAT="${DISKSTAT}, SMART: Error"
-        WARNING=0
-        CRITICAL=1
-        SMART_ERROR="`expr $SMART_ERROR + 1`"
-      elif [ "$diskSmartInfo" -eq "1" ]; then
-        DISKSTAT="${DISKSTAT}, SMART: Warning"
-        WARNING=1
-        SMART_WARNING="`expr $SMART_WARNING + 1`"
-      elif [ "$diskSmartInfo" -eq "2" ]; then
-        DISKSTAT="${DISKSTAT}, SMART: Abnormal"
-        WARNING=0
-        CRITICAL=1
-        SMART_ABNORMAL="`expr $SMART_ABNORMAL + 1`"
+        if [ "$Disk_Status" -eq "0" ]; then
+          DISKSTAT="Status: Available"
+          DISK_OK="`expr $DISK_OK + 1`"
+        elif [ "$diskModel" = "--" ]; then
+          DISKSTAT="Status: Not Available"
+          WARNING=0
+          CRITICAL=1
+          DISK_CRITICAL="`expr $DISK_CRITICAL + 1`"
+        fi
+
+        diskSmartInfo="$(_snmpgetval "$table_snmp.7.$DISK" | sed 's/^"\(.*\).$/\1/')"
+
+        if [ "$diskSmartInfo" == "GOOD" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Good"
+          SMART_GOOD="`expr $SMART_GOOD + 1`"
+        elif [ "$diskSmartInfo" == "ERROR" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Error"
+          WARNING=0
+          CRITICAL=1
+          SMART_ERROR="`expr $SMART_ERROR + 1`"
+        elif [ "$diskSmartInfo" == "WARNING" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Warning"
+          WARNING=1
+          SMART_WARNING="`expr $SMART_WARNING + 1`"
+        elif [ "$diskSmartInfo" == "ABNORMAL" ]; then
+          DISKSTAT="${DISKSTAT}, SMART: Abnormal"
+          WARNING=0
+          CRITICAL=1
+          SMART_ABNORMAL="`expr $SMART_ABNORMAL + 1`"
+        fi
+
+
+        diskCpctStr="$(_snmpgetval "$table_snmp.6.$DISK")"
+        fdiskCpctStr=""
+
+        # Assume all disks have sizes in the GB to TB range & format accordingly
+        if [ "$(echo "scale=0; 2^40" | bc -l)" -lt "$diskCpctStr" ]; then
+          fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^40)" | bc -l)TB"
+        elif [ "$(echo "scale=0; 2^30" | bc -l)" -lt "$diskCpctStr" ]; then
+          fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^30)" | bc -l)GB"
+        fi
+
+        diskTemperature="$(_snmpgetval "$table_snmp.3.$DISK")"
+        
+        if [[ "$strTempWarning" && "$diskTemperature" -ge "$strTempWarning" ]]; then
+          WARNING=1
+        elif [[ "$strTempCritical" && "$diskTemperature" -ge "$strTempCritical" ]]; then
+          CRITICAL=1
+        fi
+
+        diskGlobalSpareStr=""
+
+        diskId="$(_snmpgetval "$table_snmp.1.$DISK")"
+
+        if [ $DISK_CRITICAL -eq 1 ]; then
+          ALLOUTPUT="${ALLOUTPUT}CRITICAL: "
+        elif [ $DISK_WARNING -eq 1 ]; then
+          ALLOUTPUT="${ALLOUTPUT}WARNING: "
+        fi
+
+        ALLOUTPUT="${ALLOUTPUT} $disktype Disk $DISK (ID $diskId) $DISKSTAT,$diskGlobalSpareStr Capacity: $fdiskCpctStr, Temperature: ${diskTemperature}°C, Model: $diskModel"
+
+        if [ "$DISK" -lt "$DISKCOUNT" ]; then
+          ALLOUTPUT="${ALLOUTPUT}\n"
+        fi
+
+        #Performance Data
+        if [ $DISK -gt 1 ]; then
+          PERFDATA="$PERFDATA "
+        fi
+        PERFDATA="${PERFDATA}Capacity_${disktype}Disk_$diskId=$fdiskCpctStr;;;; Temperature_${disktype}Disk_$diskId=$diskTemperature;$strTempWarning;$strTempCritical;;"
       fi
-
-
-      diskCpctStr="$(_snmpgetval "$table_snmp.9.$DISK")"
-      fdiskCpctStr=""
-
-      # Assume all disks have sizes in the GB to TB range & format accordingly
-      if [ "$(echo "scale=0; 2^40" | bc -l)" -lt "$diskCpctStr" ]; then
-        fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^40)" | bc -l)TB"
-      elif [ "$(echo "scale=0; 2^30" | bc -l)" -lt "$diskCpctStr" ]; then
-        fdiskCpctStr="$(echo "scale=0; $diskCpctStr*1/(2^30)" | bc -l)GB"
-      fi
-
-      diskTemperature="$(_snmpgetval "$table_snmp.6.$DISK")"
-      
-      if [[ "$strTempWarning" && "$diskTemperature" -ge "$strTempWarning" ]]; then
-        WARNING=1
-      elif [[ "$strTempCritical" && "$diskTemperature" -ge "$strTempCritical" ]]; then
-        CRITICAL=1
-      fi
-
-      diskGlobalSpare="$(_snmpgetval "$table_snmp.7.$DISK")"
-      diskGlobalSpareStr=""
-
-      if [ "$diskGlobalSpare" -eq "1" ]; then
-        diskGlobalSpareStr=" Global Spare,"
-      fi
-
-      diskId="$(_snmpgetval "$table_snmp.2.$DISK")"
-      diskModel="$(_snmpgetval "$table_snmp.8.$DISK")"
-
-      if [ $DISK_CRITICAL -eq 1 ]; then
-        ALLOUTPUT="${ALLOUTPUT}CRITICAL: "
-      elif [ $DISK_WARNING -eq 1 ]; then
-        ALLOUTPUT="${ALLOUTPUT}WARNING: "
-      fi
-
-      ALLOUTPUT="${ALLOUTPUT} $disktype Disk $DISK (ID $diskId) $DISKSTAT,$diskGlobalSpareStr Capacity: $fdiskCpctStr, Temperature: ${diskTemperature}°C, Model: $diskModel"
-
-      if [ "$DISK" -lt "$DISKCOUNT" ]; then
-        ALLOUTPUT="${ALLOUTPUT}\n"
-      fi
-
-      #Performance Data
-      if [ $DISK -gt 1 ]; then
-        PERFDATA="$PERFDATA "
-      fi
-      PERFDATA="${PERFDATA}Capacity_${disktype}Disk_$diskId=$fdiskCpctStr;;;; Temperature_${disktype}Disk_$diskId=$diskTemperature;$strTempWarning;$strTempCritical;;"
+      DISKIDX="`expr $DISKIDX + 1`"
     fi
-    DISKIDX="`expr $DISKIDX + 1`"
   done
 
   if [ "$strWarning" != "" ]; then
@@ -471,6 +565,8 @@ elif [ "$strPart" == "diskstatus" ]; then
     ALLOUTPUT="CRITICAL: One or more Disks in critical condition.\n${ALLOUTPUT}"
   elif [ $DISK_WARNING -ge 1 ]; then
     ALLOUTPUT="WARNING: One or more Disks in warning condition.\n${ALLOUTPUT}"
+  else
+    ALLOUTPUT="OK: All Disks are OK.\n${ALLOUTPUT}"
   fi
 
   PERFDATA="DiskCount=$ALLDISKCOUNT;$outStrWarning;$outStrCritical;; DiskOK=$DISK_OK;;;; DiskWarning=$DISK_WARNING;;;; DiskCritical=$DISK_CRITICAL;;;; SmartGood=$SMART_GOOD;;;; SmartWarning=$SMART_WARNING;;;; SmartError=$SMART_ERROR;;;; SmartAbnormal=$SMART_ABNORMAL;;;; ${PERFDATA}"
@@ -555,18 +651,23 @@ elif [ "$strPart" == "cpu" ]; then
 
 # CPUTEMP ----------------------------------------------------------------------------------------------------------------------------------------------
 elif [ "$strPart" == "cputemp" ]; then
-  TEMP0="$(_snmpgetval .1.3.6.1.4.1.24681.1.2.5.0 | sed -E 's/"([0-9.]+) ?C.*/\1/')"
-  OUTPUT="CPU Temperature: ${TEMP0}°C|NAS CPUtemperature=${TEMP0}C;$strWarning;$strCritical;;"
-
-  if [ "$TEMP0" -ge "$strCritical" ]; then
-    echo "CRITICAL: $OUTPUT"
-    exit $EXIT_CRITICAL
-  elif [ "$TEMP0" -ge "$strWarning" ]; then
-      echo "WARNING: $OUTPUT"
-      exit $EXIT_WARNING
+  TEMP0="$(_snmpgetval .1.3.6.1.4.1.24681.1.2.5.0 | sed -E 's/"([0-9.]+) ?C.*/\1/' | tr -d '"' | xargs)"
+  if [[ "" == "$TEMP0" ]]; then
+    echo "UNKNOWN: NAS did not return a cpu temperature."
+    exit $EXIT_UNKNOWN
   else
-    echo "OK: $OUTPUT"
-    exit $EXIT_OK
+    OUTPUT="CPU Temperature: ${TEMP0}°C|NAS CPUtemperature=${TEMP0}C;$strWarning;$strCritical;;"
+
+    if [ "$TEMP0" -ge "$strCritical" ]; then
+      echo "CRITICAL: $OUTPUT"
+      exit $EXIT_CRITICAL
+    elif [ "$TEMP0" -ge "$strWarning" ]; then
+        echo "WARNING: $OUTPUT"
+        exit $EXIT_WARNING
+    else
+      echo "OK: $OUTPUT"
+      exit $EXIT_OK
+    fi
   fi
 
 # Free RAM---------------------------------------------------------------------------------------------------------------------------------------
